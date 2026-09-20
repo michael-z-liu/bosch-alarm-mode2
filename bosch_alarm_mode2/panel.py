@@ -887,11 +887,20 @@ class Panel:
         self.history_observer._notify()
         return r
 
+    async def _delayed_load_faults(self) -> None:
+        # Solution panels can stop responding on the automation session if a
+        # command arrives while they are committing an arm/alarm state change,
+        # which is exactly when the history event for that change is pushed.
+        # Give the panel a few seconds before requesting the system status.
+        await asyncio.sleep(5)
+        if self._connection:
+            await self._load_faults()
+
     def _event_history_finalizer(self) -> None:
         # Some panels don't support the subscription for panel status
         # Since the panel creates history events for most faults
         # we can just update faults when we get a history event.
-        asyncio.create_task(self._load_faults())
+        asyncio.create_task(self._delayed_load_faults())
 
     def _panel_status_consumer(self, data: bytearray) -> int:
         self._set_panel_faults(BE_INT.int16(data, 1))
