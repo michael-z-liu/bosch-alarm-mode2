@@ -29,6 +29,9 @@ from .utils import BE_INT, Observable
 
 LOG = logging.getLogger(__name__)
 
+# Seconds to hold outgoing commands after the panel reports a state change.
+STATE_CHANGE_BLACKOUT = 1.0
+
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
@@ -212,6 +215,7 @@ class Panel:
         self.faults_observer = Observable()
         self._connection: Connection | None = None
         self._monitor_connection_task: asyncio.Task[Any] | None = None
+        self._last_state_change: datetime | None = None
         self._last_msg: datetime | None = None
         self._poll_task: asyncio.Task[None] | None = None
 
@@ -373,6 +377,17 @@ class Panel:
     async def _send_command(self, code: int, data: bytes = bytearray()) -> bytearray:
         if not self._connection:
             raise asyncio.InvalidStateError("Not connected")
+        # Some panels (observed on Solution 3000) stop responding on the
+        # automation session if a command arrives while they are committing an
+        # arm/alarm state change. Hold outgoing commands during that blackout.
+        last_change = self._last_state_change
+        if last_change is not None:
+            elapsed = (datetime.now() - last_change).total_seconds()
+            if 0 <= elapsed < STATE_CHANGE_BLACKOUT:
+                LOG.debug("Holding command %02x for %.1fs", code, STATE_CHANGE_BLACKOUT - elapsed)
+                await asyncio.sleep(STATE_CHANGE_BLACKOUT - elapsed)
+            if not self._connection:
+                raise asyncio.InvalidStateError("Not connected")
         return await self._connection.send_command(code, data)
 
     def _on_disconnect(self) -> None:
@@ -820,6 +835,7 @@ class Panel:
     def _area_on_off_consumer(self, data: bytearray) -> int:
         area_id = BE_INT.int16(data)
         area_status = self.areas[area_id].status = data[2]
+        self._last_state_change = datetime.now()
         LOG.debug("Area %d: %s" % (area_id, AREA_STATUS.TEXT[area_status]))
         return 3
 
@@ -884,23 +900,15 @@ class Panel:
 
     def _event_history_consumer(self, data: bytearray) -> int:
         r = self._history.parse_subscription_event(data)
+        self._last_state_change = datetime.now()
         self.history_observer._notify()
         return r
-
-    async def _delayed_load_faults(self) -> None:
-        # Solution panels can stop responding on the automation session if a
-        # command arrives while they are committing an arm/alarm state change,
-        # which is exactly when the history event for that change is pushed.
-        # Give the panel a few seconds before requesting the system status.
-        await asyncio.sleep(5)
-        if self._connection:
-            await self._load_faults()
 
     def _event_history_finalizer(self) -> None:
         # Some panels don't support the subscription for panel status
         # Since the panel creates history events for most faults
         # we can just update faults when we get a history event.
-        asyncio.create_task(self._delayed_load_faults())
+        asyncio.create_task(self._load_faults())
 
     def _panel_status_consumer(self, data: bytearray) -> int:
         self._set_panel_faults(BE_INT.int16(data, 1))
